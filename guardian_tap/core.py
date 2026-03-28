@@ -1,58 +1,31 @@
 """Core module: attaches an observer WebSocket endpoint to any FastAPI app
-and intercepts outgoing WebSocket messages via ASGI middleware."""
+and intercepts outgoing WebSocket messages by wrapping the ASGI callable."""
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Callable, Awaitable
+from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from starlette.types import ASGIApp, Receive, Scope, Send, Message
+from starlette.types import Receive, Scope, Send, Message
 
 logger = logging.getLogger("guardian_tap")
 
-# Global set of observer connections
 _observers: set[WebSocket] = set()
 
 
-async def _broadcast_to_observers(data: dict) -> None:
-    """Send a JSON payload to all connected observers."""
+async def _broadcast(text: str) -> None:
+    """Broadcast a raw JSON string to all observers."""
     if not _observers:
         return
     dead: set[WebSocket] = set()
     for obs in _observers:
         try:
-            await obs.send_json(data)
+            await obs.send_text(text)
         except Exception:
             dead.add(obs)
     _observers.difference_update(dead)
-
-
-class _ObserverMiddleware:
-    """ASGI middleware that intercepts WebSocket send messages and broadcasts them."""
-
-    def __init__(self, app: ASGIApp, observe_path: str = "/ws-observe") -> None:
-        self.app = app
-        self.observe_path = observe_path
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "websocket" or scope["path"] == self.observe_path:
-            await self.app(scope, receive, send)
-            return
-
-        # Wrap send to intercept outgoing WebSocket text messages
-        async def send_wrapper(message: Message) -> None:
-            await send(message)
-            if message["type"] == "websocket.send" and "text" in message:
-                try:
-                    data = json.loads(message["text"])
-                    if isinstance(data, dict):
-                        await _broadcast_to_observers(data)
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    pass
-
-        await self.app(scope, receive, send_wrapper)
 
 
 def attach_observer(
@@ -61,16 +34,21 @@ def attach_observer(
 ) -> None:
     """Attach a GuardianAI observer endpoint to a FastAPI app.
 
+    This does two things:
+    1. Adds a /ws-observe WebSocket endpoint for observers to connect to.
+    2. Wraps the ASGI app to intercept all outgoing WebSocket messages
+       and broadcast them to observers.
+
     Args:
         app: The FastAPI application instance.
-        path: The WebSocket path for observers to connect to.
+        path: The WebSocket path for observers. Defaults to "/ws-observe".
 
     Usage:
         from guardian_tap import attach_observer
         attach_observer(app)
     """
 
-    # 1. Add the observer WebSocket endpoint
+    # 1. Add the observer endpoint
     @app.websocket(path)
     async def _guardian_observe(websocket: WebSocket) -> None:
         await websocket.accept()
@@ -83,17 +61,29 @@ def attach_observer(
             _observers.discard(websocket)
             logger.info("Guardian observer disconnected (%d remaining)", len(_observers))
 
-    # 2. Add ASGI middleware to intercept WebSocket messages
-    app.add_middleware(_ObserverMiddleware, observe_path=path)
+    # 2. Wrap the app's ASGI __call__ to intercept WebSocket sends
+    _original_call = app.__call__
+
+    async def _patched_call(scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") == "websocket" and scope.get("path") != path:
+            async def send_wrapper(message: Message) -> None:
+                await send(message)
+                if (
+                    message.get("type") == "websocket.send"
+                    and "text" in message
+                    and _observers
+                ):
+                    await _broadcast(message["text"])
+
+            await _original_call(scope, receive, send_wrapper)
+        else:
+            await _original_call(scope, receive, send)
+
+    app.__call__ = _patched_call  # type: ignore[method-assign]
 
     logger.info("guardian-tap attached at %s", path)
 
 
 async def broadcast(data: dict) -> None:
-    """Manually broadcast a JSON payload to all connected observers.
-
-    Use this to send custom events:
-        import guardian_tap
-        await guardian_tap.broadcast({"type": "custom_event", "data": {...}})
-    """
-    await _broadcast_to_observers(data)
+    """Manually broadcast a JSON payload to all connected observers."""
+    await _broadcast(json.dumps(data))
