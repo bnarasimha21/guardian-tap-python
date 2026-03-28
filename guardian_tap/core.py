@@ -114,15 +114,15 @@ class _TapMiddleware:
             await self.app(scope, receive, ws_send_wrapper)
             return
 
-        # HTTP interception (for SSE streams)
+        # HTTP interception (SSE streams + JSON responses)
         if scope_type == "http" and _observers:
-            is_sse = False
+            content_type = ""
 
             async def http_send_wrapper(message: Message) -> None:
-                nonlocal is_sse
+                nonlocal content_type
                 await send(message)
 
-                # Detect SSE from response headers
+                # Capture content-type from response headers
                 if message.get("type") == "http.response.start":
                     headers = dict(
                         (k.decode() if isinstance(k, bytes) else k,
@@ -130,21 +130,26 @@ class _TapMiddleware:
                         for k, v in message.get("headers", [])
                     )
                     content_type = headers.get("content-type", "")
-                    is_sse = "text/event-stream" in content_type
 
-                # Intercept SSE body chunks
+                # Intercept response body
                 if (
-                    is_sse
-                    and message.get("type") == "http.response.body"
+                    message.get("type") == "http.response.body"
                     and message.get("body")
                 ):
                     body = message["body"]
                     if isinstance(body, bytes):
                         body = body.decode("utf-8", errors="ignore")
 
-                    events = _extract_sse_events(body)
-                    for event in events:
-                        await _broadcast(json.dumps(event))
+                    if "text/event-stream" in content_type:
+                        # SSE: parse event/data lines
+                        events = _extract_sse_events(body)
+                        for event in events:
+                            await _broadcast(json.dumps(event))
+                    elif "application/json" in content_type:
+                        # JSON API response: broadcast if it's a dict
+                        parsed = _try_parse_json(body)
+                        if parsed is not None:
+                            await _broadcast(json.dumps(parsed))
 
             await self.app(scope, receive, http_send_wrapper)
             return
