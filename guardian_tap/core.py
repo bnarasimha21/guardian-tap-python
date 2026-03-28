@@ -1,10 +1,11 @@
 """Core module: attaches an observer WebSocket endpoint to any FastAPI app
-and intercepts outgoing WebSocket messages by wrapping the middleware stack."""
+and intercepts outgoing messages (WebSocket and SSE) by wrapping the middleware stack."""
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from starlette.types import ASGIApp, Receive, Scope, Send, Message
@@ -12,6 +13,9 @@ from starlette.types import ASGIApp, Receive, Scope, Send, Message
 logger = logging.getLogger("guardian_tap")
 
 _observers: set[WebSocket] = set()
+
+# Regex to parse SSE "data:" lines
+_SSE_DATA_RE = re.compile(r"^data:\s*(.+)$", re.MULTILINE)
 
 
 async def _broadcast(text: str) -> None:
@@ -27,16 +31,76 @@ async def _broadcast(text: str) -> None:
     _observers.difference_update(dead)
 
 
+def _try_parse_json(text: str) -> dict | None:
+    """Try to parse a string as JSON dict. Returns None on failure."""
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _extract_sse_events(body: str) -> list[dict]:
+    """Extract JSON payloads from SSE body chunks.
+
+    SSE format:
+        event: some_event
+        data: {"key": "value"}
+
+    We extract the data lines and parse them as JSON.
+    We also capture the event type from preceding "event:" lines.
+    """
+    events = []
+    current_event_type = None
+
+    for line in body.split("\n"):
+        line = line.strip()
+        if line.startswith("event:"):
+            current_event_type = line[6:].strip()
+        elif line.startswith("data:"):
+            data_str = line[5:].strip()
+            parsed = _try_parse_json(data_str)
+            if parsed is not None:
+                # Wrap in a standard envelope if it doesn't have "type"
+                if "type" not in parsed and current_event_type:
+                    events.append({
+                        "type": current_event_type,
+                        "data": parsed,
+                    })
+                else:
+                    events.append(parsed)
+                current_event_type = None
+            elif current_event_type and data_str:
+                # Non-JSON data line
+                events.append({
+                    "type": current_event_type,
+                    "data": {"raw": data_str},
+                })
+                current_event_type = None
+
+    return events
+
+
 class _TapMiddleware:
-    """ASGI wrapper that intercepts WebSocket sends and broadcasts to observers."""
+    """ASGI wrapper that intercepts WebSocket sends and SSE responses,
+    broadcasting them to connected observers."""
 
     def __init__(self, app: ASGIApp, observe_path: str) -> None:
         self.app = app
         self.observe_path = observe_path
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope.get("type") == "websocket" and scope.get("path") != self.observe_path:
-            async def send_wrapper(message: Message) -> None:
+        scope_type = scope.get("type", "")
+        path = scope.get("path", "")
+
+        # Skip the observer endpoint itself
+        if path == self.observe_path:
+            await self.app(scope, receive, send)
+            return
+
+        # WebSocket interception
+        if scope_type == "websocket":
+            async def ws_send_wrapper(message: Message) -> None:
                 await send(message)
                 if (
                     message.get("type") == "websocket.send"
@@ -45,9 +109,46 @@ class _TapMiddleware:
                 ):
                     await _broadcast(message["text"])
 
-            await self.app(scope, receive, send_wrapper)
-        else:
-            await self.app(scope, receive, send)
+            await self.app(scope, receive, ws_send_wrapper)
+            return
+
+        # HTTP interception (for SSE streams)
+        if scope_type == "http" and _observers:
+            is_sse = False
+
+            async def http_send_wrapper(message: Message) -> None:
+                nonlocal is_sse
+                await send(message)
+
+                # Detect SSE from response headers
+                if message.get("type") == "http.response.start":
+                    headers = dict(
+                        (k.decode() if isinstance(k, bytes) else k,
+                         v.decode() if isinstance(v, bytes) else v)
+                        for k, v in message.get("headers", [])
+                    )
+                    content_type = headers.get("content-type", "")
+                    is_sse = "text/event-stream" in content_type
+
+                # Intercept SSE body chunks
+                if (
+                    is_sse
+                    and message.get("type") == "http.response.body"
+                    and message.get("body")
+                ):
+                    body = message["body"]
+                    if isinstance(body, bytes):
+                        body = body.decode("utf-8", errors="ignore")
+
+                    events = _extract_sse_events(body)
+                    for event in events:
+                        await _broadcast(json.dumps(event))
+
+            await self.app(scope, receive, http_send_wrapper)
+            return
+
+        # Everything else: pass through
+        await self.app(scope, receive, send)
 
 
 def attach_observer(
@@ -55,6 +156,9 @@ def attach_observer(
     path: str = "/ws-observe",
 ) -> None:
     """Attach a GuardianAI observer endpoint to a FastAPI app.
+
+    Supports both WebSocket and SSE (Server-Sent Events) apps.
+    All outgoing messages are broadcast to connected observers.
 
     Args:
         app: The FastAPI application instance.
@@ -78,16 +182,13 @@ def attach_observer(
             _observers.discard(websocket)
             logger.info("Guardian observer disconnected (%d remaining)", len(_observers))
 
-    # 2. Wrap the middleware stack at startup to intercept WebSocket sends.
-    #    We do this in a startup event because Starlette builds the stack lazily.
+    # 2. Wrap the middleware stack at startup
     @app.on_event("startup")
     async def _install_tap() -> None:
-        # Force the middleware stack to build if it hasn't yet
         if app.middleware_stack is None:
             app.middleware_stack = app.build_middleware_stack()
-        # Wrap it with our interceptor
         app.middleware_stack = _TapMiddleware(app.middleware_stack, observe_path=path)
-        logger.info("guardian-tap: middleware installed at %s", path)
+        logger.info("guardian-tap: middleware installed at %s (ws + sse)", path)
 
     logger.info("guardian-tap attached at %s", path)
 
